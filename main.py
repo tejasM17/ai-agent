@@ -1,15 +1,18 @@
 import os
+import json
+import asyncio
 from uuid import uuid4
 from datetime import datetime
 from typing import Dict, Any
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from pydantic import BaseModel
 
 # Import from enhanced agents
-from agents import process_patient_case, TriageReport
+from agents import process_patient_case, TriageReport, logs_queue
 
 # -----------------------------------
 # FASTAPI APP
@@ -62,6 +65,24 @@ def alert_doctor(task_id: str, urgency: str, report: TriageReport):
 # MAIN PIPELINE ENDPOINT
 # -----------------------------------
 
+@app.get("/api/incoming-patient")
+async def get_all_patients():
+    """Retrieve all patient triage cases"""
+    return {
+        "total_tasks": len(tasks_db),
+        "tasks": tasks_db
+    }
+
+@app.get("/api/ai-logs")
+async def stream_logs():
+    """Stream AI agent logs using Server-Sent Events (SSE)"""
+    async def log_generator():
+        while True:
+            log = await logs_queue.get()
+            yield f"data: {json.dumps(log)}\n\n"
+            
+    return StreamingResponse(log_generator(), media_type="text/event-stream")
+
 @app.post("/api/incoming-patient")
 async def process_patient(
     request: PatientEmail,
@@ -82,7 +103,10 @@ async def process_patient(
         # ======================
         # FULL AUTONOMOUS PIPELINE
         # ======================
-        result = process_patient_case(request.email_body)
+        # Run in a thread to avoid blocking the event loop, 
+        # allowing logs to be streamed while processing
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, process_patient_case, request.email_body)
 
         triage_report: TriageReport = result["triage_report"]
 
@@ -116,13 +140,17 @@ async def process_patient(
         }
 
     except Exception as e:
-        print(f"[Task {task_id}] Error: {e}")
-        tasks_db[task_id] = {
-            "status": "failed",
-            "error": str(e),
-            "timestamp": datetime.now()
-        }
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        error_msg = f"Processing failed: {str(e)}"
+        print(f"[Task {task_id}] Error: {error_msg}")
+        
+        if task_id in tasks_db:
+            tasks_db[task_id].update({
+                "status": "failed",
+                "error": error_msg,
+                "timestamp": datetime.now()
+            })
+            
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 # -----------------------------------
@@ -144,6 +172,42 @@ async def get_task_status(task_id: str):
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail="Task not found")
     return tasks_db[task_id]
+
+@app.get("/api/reports/{task_id}")
+async def generate_report(task_id: str):
+    """Generate a formatted medical report for a specific task"""
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task = tasks_db[task_id]
+    
+    if task["status"] != "completed":
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "message": "Report not ready yet."
+        }
+    
+    report_data = task["triage_report"]
+    
+    # Create a structured, professional format
+    formatted_report = {
+        "header": {
+            "report_id": f"REP-{task_id.upper()}",
+            "generated_at": datetime.now().isoformat(),
+            "patient_case_ref": task_id
+        },
+        "clinical_summary": {
+            "urgency_level": report_data["urgency"],
+            "identified_symptoms": report_data["symptoms_list"],
+            "initial_assessment": report_data["doctor_notes"]
+        },
+        "medical_guidance": report_data["medical_guidance"],
+        "research_background": task.get("research_summary", "No research data available."),
+        "disclaimer": "This report is AI-generated for clinical support and should be reviewed by a qualified medical professional."
+    }
+    
+    return formatted_report
 
 
 # -----------------------------------

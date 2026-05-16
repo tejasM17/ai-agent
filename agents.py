@@ -1,7 +1,10 @@
 import os
+import json
+import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -18,6 +21,27 @@ if not my_google_key:
 
 print("✅ Google API Key loaded successfully")
 
+# ====================== GLOBAL LOG QUEUE ======================
+# This will be used by FastAPI to stream logs
+logs_queue = asyncio.Queue()
+
+def log_activity(agent_name: str, message: str, data: Any = None):
+    """Helper to push logs to the queue"""
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "agent": agent_name,
+        "message": message,
+        "data": data
+    }
+    print(f"[{agent_name}] {message}")
+    try:
+        # Check if we are in an async context
+        loop = asyncio.get_running_loop()
+        loop.create_task(logs_queue.put(log_entry))
+    except RuntimeError:
+        # Not in an async context, we can't easily put it in the queue
+        # In a real app, we might use a thread-safe queue or another mechanism
+        pass
 
 # ====================== OUTPUT SCHEMA ======================
 class TriageReport(BaseModel):
@@ -29,7 +53,7 @@ class TriageReport(BaseModel):
 
 # ====================== LLM ======================
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash-lite",   # Change to "gemini-2.5-flash" if needed
+    model="gemini-3.1-flash-lite-preview",   # Available in your environment
     temperature=0.1,
     api_key=my_google_key,
     convert_system_message_to_human=True,
@@ -47,21 +71,16 @@ Rules:
 - Be concise, factual, and cite sources when possible.
 - Think step-by-step before giving final answer.""")
 
-research_prompt = ChatPromptTemplate.from_messages([
-    research_system_prompt,
-    ("human", """Patient Symptoms: {patient_text}
-
-Use the available search tool to find relevant medical guidelines.
-Then provide a detailed factual summary.""")
-])
-
 def run_research_agent(patient_text: str) -> str:
     """Researcher Agent with tool calling simulation"""
     try:
-        # First call with tool instruction
+        log_activity("Researcher", f"Starting research for: {patient_text[:50]}...")
+        
         tool_query = f"Current medical guidelines for: {patient_text}"
         web_results = medical_web_search(tool_query)
         
+        log_activity("Researcher", "Web search completed. Analyzing results...")
+
         response = llm.invoke([
             research_system_prompt,
             HumanMessage(content=f"""Patient: {patient_text}
@@ -72,10 +91,11 @@ Web Search Results:
 Now analyze and summarize only the relevant medical facts and guidelines.""")
         ])
         
+        log_activity("Researcher", "Fact summary generated.")
         return response.content
     
     except Exception as e:
-        print(f"Research Agent Error: {e}")
+        log_activity("Researcher", f"Error: {str(e)}")
         return f"Web search failed. Basic symptoms: {patient_text}"
 
 
@@ -90,12 +110,15 @@ Be strict and objective."""),
 def run_reflection(research_facts: str, patient_text: str) -> str:
     """Adds deep reasoning through reflection"""
     try:
+        log_activity("Reviewer", "Critically evaluating research findings...")
         reflection = llm.invoke(reflection_prompt.format_messages(
             research_facts=research_facts,
             patient_text=patient_text
         ))
+        log_activity("Reviewer", "Reflection completed.")
         return reflection.content
-    except:
+    except Exception as e:
+        log_activity("Reviewer", f"Error during reflection: {str(e)}")
         return "No additional reflection available."
 
 
@@ -126,13 +149,16 @@ triage_chain = triage_prompt | llm | parser
 def run_triage_agent(patient_text: str, research_facts: str, reflection: str = "") -> TriageReport:
     """Triage Officer with structured output"""
     try:
-        return triage_chain.invoke({
+        log_activity("TriageOfficer", "Synthesizing final triage decision...")
+        report = triage_chain.invoke({
             "patient_text": patient_text,
             "research_facts": research_facts,
             "reflection": reflection
         })
+        log_activity("TriageOfficer", f"Triage complete. Urgency: {report.urgency}")
+        return report
     except Exception as e:
-        print(f"Triage Agent Error: {e}")
+        log_activity("TriageOfficer", f"Error: {str(e)}")
         # Fallback
         return TriageReport(
             urgency="Medium",
@@ -147,14 +173,13 @@ def process_patient_case(patient_text: str) -> Dict[str, Any]:
     """
     Full autonomous pipeline with multi-agent collaboration + reflection
     """
-    print("🔍 Starting Research Phase...")
+    log_activity("System", "Initializing Multi-Agent Pipeline")
+    
     research_facts = run_research_agent(patient_text)
-    
-    print("🤔 Running Reflection & Critique...")
     reflection = run_reflection(research_facts, patient_text)
-    
-    print("⚕️ Running Triage Decision...")
     triage_report = run_triage_agent(patient_text, research_facts, reflection)
+    
+    log_activity("System", "Pipeline execution finished")
     
     return {
         "triage_report": triage_report,
