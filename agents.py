@@ -24,9 +24,14 @@ print("✅ Google API Key loaded successfully")
 # ====================== GLOBAL LOG QUEUE ======================
 # This will be used by FastAPI to stream logs
 logs_queue = asyncio.Queue()
+main_loop = None
+
+def set_main_loop(loop):
+    global main_loop
+    main_loop = loop
 
 def log_activity(agent_name: str, message: str, data: Any = None):
-    """Helper to push logs to the queue"""
+    """Helper to push logs to the queue safely from any thread"""
     log_entry = {
         "timestamp": datetime.now().isoformat(),
         "agent": agent_name,
@@ -34,14 +39,17 @@ def log_activity(agent_name: str, message: str, data: Any = None):
         "data": data
     }
     print(f"[{agent_name}] {message}")
-    try:
-        # Check if we are in an async context
-        loop = asyncio.get_running_loop()
-        loop.create_task(logs_queue.put(log_entry))
-    except RuntimeError:
-        # Not in an async context, we can't easily put it in the queue
-        # In a real app, we might use a thread-safe queue or another mechanism
-        pass
+    
+    if main_loop:
+        # Use call_soon_threadsafe to put item in queue from a different thread
+        main_loop.call_soon_threadsafe(logs_queue.put_nowait, log_entry)
+    else:
+        # Fallback if loop isn't set yet
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(logs_queue.put(log_entry))
+        except RuntimeError:
+            pass
 
 # ====================== OUTPUT SCHEMA ======================
 class TriageReport(BaseModel):
@@ -53,7 +61,7 @@ class TriageReport(BaseModel):
 
 # ====================== LLM ======================
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite-preview",   # Available in your environment
+    model="gemini-3.1-flash-lite-preview",   # Switching to 2.0 Flash for fresh quota
     temperature=0.1,
     api_key=my_google_key,
     convert_system_message_to_human=True,

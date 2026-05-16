@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # Import from enhanced agents
-from agents import process_patient_case, TriageReport, logs_queue
+from agents import process_patient_case, TriageReport, logs_queue, set_main_loop
 
 # -----------------------------------
 # FASTAPI APP
@@ -23,6 +23,12 @@ app = FastAPI(
     description="Intelligent Medical Triage System with Multi-Agent Pipeline",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+async def startup_event():
+    # Set the main loop for thread-safe logging
+    set_main_loop(asyncio.get_running_loop())
+    print("🚀 System initialized with thread-safe logging")
 
 # -----------------------------------
 # CORS (for React Frontend)
@@ -81,7 +87,15 @@ async def stream_logs():
             log = await logs_queue.get()
             yield f"data: {json.dumps(log)}\n\n"
             
-    return StreamingResponse(log_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        log_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 @app.post("/api/incoming-patient")
 async def process_patient(
@@ -93,8 +107,9 @@ async def process_patient(
     try:
         print(f"\n[Task {task_id}] Received new patient case")
 
-        # Store initial task status
+        # Store initial task status with ID included for easier frontend access
         tasks_db[task_id] = {
+            "task_id": task_id,
             "status": "processing",
             "timestamp": datetime.now(),
             "email_body": request.email_body[:500] + "..." if len(request.email_body) > 500 else request.email_body
