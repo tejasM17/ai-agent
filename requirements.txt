@@ -7,3 +7,5 @@ langchain-core
 langchain-community
 python-dotenv
 duckduckgo-search
+langchain-google-genai
+gunicorn
